@@ -358,7 +358,16 @@ class GGUFReader:
                 item_type = np.uint8
                 # I2_S/TL1/TL2: packed data with appended metadata, actual byte count
                 # differs from computed n_bytes. Use raw flat array without reshape.
-                if ggml_type in (GGMLQuantizationType.I2_S, GGMLQuantizationType.TL1, GGMLQuantizationType.TL2):
+                if ggml_type == GGMLQuantizationType.TL2:
+                    # Must match preprocess_weights_tl2()'s pad target in
+                    # convert-hf-to-gguf-bitnet.py: TL2's scale is a separate
+                    # "<layer>.scale" tensor, not an inline trailing header.
+                    # `dims` is in on-disk (reversed) order here, i.e. (k, m).
+                    k, m = int(dims[0]), int(dims[1])
+                    actual_bytes = (k - 256) * m // 3 * 5 // 8 + 256 * m // 2 * 4 // 8
+                    item_count = actual_bytes
+                    np_dims = (actual_bytes,)
+                elif ggml_type in (GGMLQuantizationType.I2_S, GGMLQuantizationType.TL1):
                     # Compute actual bytes: n_elems/4 (2-bit packed) + 32 (scale + alignment)
                     actual_bytes = n_elems // 4 + 32
                     item_count = actual_bytes

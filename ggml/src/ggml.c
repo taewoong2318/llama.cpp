@@ -1315,9 +1315,11 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
         if (tensor->type == GGML_TYPE_I2_S || tensor->type == GGML_TYPE_TL1) {
             nbytes = nbytes / 4 + 32;
         } else if (tensor->type == GGML_TYPE_TL2) {
+            // Must match preprocess_weights_tl2()'s pad target in
+            // convert-hf-to-gguf-bitnet.py exactly: unlike I2_S/TL1, TL2's scale is
+            // written as a separate "<layer>.scale" GGUF tensor, not an inline
+            // trailing header, so there is no extra +32 here.
             nbytes = (tensor->ne[0] - 256) * tensor->ne[1] / 3 * 5 / 8 + 256 * tensor->ne[1] / 2 * 4 / 8;
-            if (nbytes % 32 != 0) nbytes = 32 - nbytes % 32 + nbytes;
-            nbytes += 32;
         }
     }
     else {

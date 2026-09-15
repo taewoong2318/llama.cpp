@@ -270,11 +270,10 @@ class GGUFWriter:
                     ti_data += self._pack("Q", ti.shape[n_dims - 1 - j])
                 ti_data += self._pack("I", ti.dtype)
                 ti_data += self._pack("Q", offset_tensor)
-                dtype = ti.dtype
-                if ti.dtype == GGMLQuantizationType.TL1 or dtype == GGMLQuantizationType.TL2:
-                    offset_tensor += GGUFWriter.ggml_pad(ti.nbytes, self.data_alignment) + self.data_alignment
-                else:
-                    offset_tensor += GGUFWriter.ggml_pad(ti.nbytes, self.data_alignment)
+                # Note: TL1/TL2 scales are written as separate "<layer>.scale" tensors
+                # (see convert-hf-to-gguf-bitnet.py), not an inline trailing header, so
+                # no extra alignment gap is needed here for them.
+                offset_tensor += GGUFWriter.ggml_pad(ti.nbytes, self.data_alignment)
 
             fout.write(ti_data)
             fout.flush()
