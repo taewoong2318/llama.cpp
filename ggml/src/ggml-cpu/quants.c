@@ -1368,16 +1368,26 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
     uint8_t * q = (uint8_t *)dst;
     memset(q, 0, n / 4);
 
-    for (int64_t i = 0; i < n; i++) {
-        uint8_t val;
-        if (fabs((double)src[i]) < 1e-6) {
-            val = 1; // maps to 0
-        } else {
-            val = ((double)src[i] * max > 0) ? 2 : 0; // maps to +1 or -1
+    // Packing layout must match dequantize_row_i2_s: within each 128-element
+    // block, byte (done/4 + gp) holds elements (done + k*32 + gp) for k=0..3
+    // in bits [7:6],[5:4],[3:2],[1:0] respectively (not 4 consecutive elements).
+    int64_t done = 0;
+    while (done < n) {
+        for (int gp = 0; gp < 32; gp++) {
+            uint8_t vals[4];
+            for (int k = 0; k < 4; k++) {
+                int64_t idx = done + k * 32 + gp;
+                if (idx >= n) {
+                    vals[k] = 1; // zero
+                } else if (fabs((double)src[idx]) < 1e-6) {
+                    vals[k] = 1; // maps to 0
+                } else {
+                    vals[k] = ((double)src[idx] * max > 0) ? 2 : 0; // maps to +1 or -1
+                }
+            }
+            q[done / 4 + gp] = (uint8_t)((vals[0] << 6) | (vals[1] << 4) | (vals[2] << 2) | vals[3]);
         }
-        int byte_idx = i / 4;
-        int bit_pos = 6 - 2 * (i % 4);
-        q[byte_idx] |= (val << bit_pos);
+        done += 128;
     }
 
     float * scale_ptr = (float *)(q + n / 4);
