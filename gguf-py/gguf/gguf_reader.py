@@ -367,7 +367,14 @@ class GGUFReader:
                     actual_bytes = (k - 256) * m // 3 * 5 // 8 + 256 * m // 2 * 4 // 8
                     item_count = actual_bytes
                     np_dims = (actual_bytes,)
-                elif ggml_type in (GGMLQuantizationType.I2_S, GGMLQuantizationType.TL1):
+                elif ggml_type == GGMLQuantizationType.TL1:
+                    # Must match preprocess_weights_tl1()'s pad target in
+                    # convert-hf-to-gguf-bitnet.py: unlike I2_S, TL1's scale is a
+                    # separate "<layer>.scale" tensor, not an inline trailing header.
+                    actual_bytes = n_elems // 4
+                    item_count = actual_bytes
+                    np_dims = (actual_bytes,)
+                elif ggml_type == GGMLQuantizationType.I2_S:
                     # Compute actual bytes: n_elems/4 (2-bit packed) + 32 (scale + alignment)
                     actual_bytes = n_elems // 4 + 32
                     item_count = actual_bytes
