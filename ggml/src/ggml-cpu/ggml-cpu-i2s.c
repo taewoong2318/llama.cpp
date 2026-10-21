@@ -180,40 +180,16 @@ void ggml_gemm_i2_i8_s(int n, float * GGML_RESTRICT s, size_t bs, const void * G
         }
     }
 #else
-    // Scalar / non-AVX2 fallback: use vec_dot row by row
-    const int64_t row_block = ROW_BLOCK_SIZE;
-    const int64_t col_block = COL_BLOCK_SIZE;
-
-#if defined(ACT_PARALLEL)
-    for (int64_t c0 = 0; c0 < nc; c0 += col_block) {
-        int64_t cur_c = (c0 + col_block <= nc) ? col_block : (nc - c0);
-        for (int64_t r0 = 0; r0 < nr; r0 += row_block) {
-            int64_t cur_r = (r0 + row_block <= nr) ? row_block : (nr - r0);
-            const void * vy_r = (const uint8_t *)vy + r0 * n;
-            for (int64_t c = 0; c < cur_c; ++c) {
-                const int64_t col = c0 + c;
-                float * s_col = s + col;
-                const void * vx_col = (const uint8_t *)vx + col * n / 4;
-                ggml_vec_dot_i2_i8_s(n, s_col + r0 * bs, bs, vx_col, n, vy_r, n, cur_r);
-            }
-        }
+    // Scalar / non-AVX2 fallback. ggml_vec_dot_i2_i8_s's nrc parameter already iterates
+    // `nrc` WEIGHT ROWS against one FIXED activation vector (advancing vx by n/4 bytes
+    // per row, writing results contiguously starting at s) -- it has no notion of
+    // batching multiple activation columns against one fixed weight row. So each
+    // activation column gets exactly one call covering all nc weight rows; there is no
+    // additional row/column blocking to do on top of that.
+    for (int64_t col = 0; col < nr; col++) {
+        const void * vy_col = (const uint8_t *)vy + col * n;
+        ggml_vec_dot_i2_i8_s(n, s + col * nc, 1, vx, n, vy_col, n, nc);
     }
-#else
-    for (int64_t r0 = 0; r0 < nr; r0 += row_block) {
-        int64_t cur_r = (r0 + row_block <= nr) ? row_block : (nr - r0);
-        const void * vy_row = (const uint8_t *)vy + r0 * n;
-        for (int64_t c0 = 0; c0 < nc; c0 += col_block) {
-            int64_t cur_c = (c0 + col_block <= nc) ? col_block : (nc - c0);
-            for (int64_t r = 0; r < cur_r; ++r) {
-                const int64_t row = r0 + r;
-                float * s_row = s + row * bs;
-                const void * vy_cur = (const uint8_t *)vy_row + r * n;
-                const void * vx_c = (const uint8_t *)vx + c0 * n / 4;
-                ggml_vec_dot_i2_i8_s(n, s_row + c0, bs, vx_c, n, vy_cur, n, cur_c);
-            }
-        }
-    }
-#endif
 #endif // __AVX2__
 }
 

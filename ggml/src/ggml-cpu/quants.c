@@ -1497,17 +1497,29 @@ static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * v
         s[row] = (float)sumi;
     }
 #else
-    // Scalar fallback
+    // Scalar fallback. Computes the RAW dot product using the unconverted 2-bit codes
+    // (0,1,2,3), matching the AVX2 path's convention above -- the caller (ggml-cpu.c's
+    // I2_S GEMV/GEMM fast path) subtracts act_sums and rescales to recover the true
+    // ternary-weighted result: since ternary_weight = code - 1 (codes 0,1,2 -> -1,0,+1;
+    // code 3 unused), true_dot = raw_dot - sum(y). Applying the -1,0,1 mapping here
+    // directly would double-correct against that same subtraction.
+    // Packing matches dequantize_row_i2_s/quantize_i2_s: within each 128-element
+    // block, byte (block*32 + gp) holds elements block*128 + k*32 + gp for k=0..3 in
+    // bits [7:6],[5:4],[3:2],[1:0] respectively -- NOT 4 consecutive elements per byte.
     const uint8_t * x = (const uint8_t *)vx;
     const int8_t * y  = (const int8_t *)vy;
-    static const int map2bit[4] = { -1, 0, 1, 0 };
     for (int row = 0; row < nrc; row++) {
         int32_t sum = 0;
+        const uint8_t * x_row = x + row * (n / 4);
         for (int i = 0; i < n; i++) {
-            int byte_idx = i / 4;
-            int bit_pos = 6 - 2 * (i % 4);
-            int w = map2bit[(x[row * (n/4) + byte_idx] >> bit_pos) & 0x03];
-            sum += w * y[i];
+            int block    = i / 128;
+            int within   = i % 128;
+            int k        = within / 32;
+            int gp       = within % 32;
+            int byte_idx = block * 32 + gp;
+            int bit_pos  = 6 - 2 * k;
+            int code = (x_row[byte_idx] >> bit_pos) & 0x03;
+            sum += code * y[i];
         }
         s[row] = (float)sum;
     }
