@@ -1496,6 +1496,53 @@ static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * v
         int sumi = hsum_i32_8(accu);
         s[row] = (float)sumi;
     }
+#elif defined(__ARM_NEON)
+    // NEON path. Same raw-dot-product convention and packing layout as the scalar
+    // fallback below -- see its comment for the caller-side correction. Codes are
+    // always 0..3 (sign bit never set), so they're reinterpreted directly as int8
+    // and fed to ggml_vdotq_s32 (ggml-cpu-impl.h), the same primitive used by every
+    // other NEON vec_dot in this codebase.
+    const uint8_t * x = (const uint8_t *)vx;
+    const int8_t  * y = (const int8_t *)vy;
+    const int nb = n / 128;
+    const uint8x16_t mask2 = vdupq_n_u8(0x03);
+
+    for (int row = 0; row < nrc; row++) {
+        const uint8_t * x_row = x + row * (n / 4);
+        int32x4_t acc = vdupq_n_s32(0);
+
+        for (int b = 0; b < nb; b++) {
+            const uint8_t * xb = x_row + b * 32;
+            const int8_t  * yb = y + b * 128;
+
+            for (int half = 0; half < 2; half++) {
+                uint8x16_t packed = vld1q_u8(xb + half * 16);
+                int8x16_t c0 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(packed, 6), mask2));
+                int8x16_t c1 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(packed, 4), mask2));
+                int8x16_t c2 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(packed, 2), mask2));
+                int8x16_t c3 = vreinterpretq_s8_u8(vandq_u8(packed, mask2));
+
+                acc = ggml_vdotq_s32(acc, c0, vld1q_s8(yb + 0 * 32 + half * 16));
+                acc = ggml_vdotq_s32(acc, c1, vld1q_s8(yb + 1 * 32 + half * 16));
+                acc = ggml_vdotq_s32(acc, c2, vld1q_s8(yb + 2 * 32 + half * 16));
+                acc = ggml_vdotq_s32(acc, c3, vld1q_s8(yb + 3 * 32 + half * 16));
+            }
+        }
+
+        int32_t sum = vaddvq_s32(acc);
+
+        for (int i = nb * 128; i < n; i++) {
+            int within   = i - nb * 128;
+            int k        = within / 32;
+            int gp       = within % 32;
+            int byte_idx = nb * 32 + gp;
+            int bit_pos  = 6 - 2 * k;
+            int code     = (x_row[byte_idx] >> bit_pos) & 0x03;
+            sum += code * y[i];
+        }
+
+        s[row] = (float)sum;
+    }
 #else
     // Scalar fallback. Computes the RAW dot product using the unconverted 2-bit codes
     // (0,1,2,3), matching the AVX2 path's convention above -- the caller (ggml-cpu.c's
