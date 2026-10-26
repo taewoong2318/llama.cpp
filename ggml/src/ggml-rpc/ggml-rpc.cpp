@@ -11,8 +11,11 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
+#include <thread>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
@@ -71,6 +74,8 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+    RPC_CMD_RELAY_TENSOR,
+    RPC_CMD_RELAY_SET_TENSOR,
     RPC_CMD_COUNT,
 };
 
@@ -186,9 +191,39 @@ struct rpc_msg_get_device_memory_rsp {
     uint64_t total_mem;
 };
 
+// wait_for_relay_generation: 0 means "this server's input never arrives via a ring relay" (the
+// first ring stage, or any server reached only via plain coordinator SET_TENSOR). A nonzero value
+// is the relay generation (see rpc_server_shared_state::relay_generation) this server must observe
+// before it is safe to run the graph -- see GRAPH_COMPUTE/GRAPH_RECOMPUTE's handlers.
+// wait_for_relay_buffer identifies (as the remote pointer value the server itself returned for it
+// at ALLOC_BUFFER time) which destination buffer wait_for_relay_generation's count refers to --
+// needed because that count is scoped per-buffer, not a single counter for the whole server
+// process; see rpc_server_shared_state for why. 0 means "no relay input on this call" (paired with
+// wait_for_relay_generation == 0).
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
+    uint64_t wait_for_relay_buffer;
+    uint64_t wait_for_relay_generation;
 };
+
+// Ring-relay extension (opt-in, see ggml_backend_rpc_set_ring_relay/ggml_backend_rpc_set_ring_next):
+// tells the server holding `src` to ship its bytes directly to this server's configured ring
+// successor (addressed by `dst`'s descriptor, as that successor server understands it), instead
+// of the caller round-tripping the data through its own memory via GET_TENSOR+SET_TENSOR.
+// One-way (fire-and-forget), like GRAPH_COMPUTE and plain SET_TENSOR: the coordinator does not
+// wait for this to complete. Correctness no longer depends on that wait -- see
+// rpc_server_shared_state::relay_generation and GRAPH_COMPUTE/GRAPH_RECOMPUTE's
+// wait_for_relay_generation field, which make the *consumer* server wait for relayed data to land
+// instead of making the coordinator wait for it to be sent.
+struct rpc_msg_relay_tensor_req {
+    rpc_tensor src;
+    rpc_tensor dst;
+};
+
+// RPC_CMD_RELAY_SET_TENSOR is also one-way now (same wire payload as plain SET_TENSOR:
+// | rpc_tensor | offset (8) | data |). The receiving server bumps its own relay_generation after
+// applying the write, which is what GRAPH_COMPUTE/GRAPH_RECOMPUTE's wait_for_relay_generation
+// actually waits on -- see rpc_server_shared_state.
 
 #pragma pack(pop)
 
@@ -498,6 +533,33 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     RPC_STATUS_ASSERT(status);
 }
 
+// Opt-in (see ggml_backend_rpc_set_ring_relay): when set, a cross-server cpy_tensor is relayed
+// directly between the two RPC servers instead of falling back to the generic
+// get_tensor(src)+set_tensor(dst) path, which would otherwise round-trip the bytes through this
+// process's own memory. Off by default so plain --rpc usage is unaffected.
+static bool g_rpc_ring_relay_enabled = false;
+
+void ggml_backend_rpc_set_ring_relay(bool enabled) {
+    g_rpc_ring_relay_enabled = enabled;
+}
+
+// Stage 2 (async ring pipelining): how many relays have been issued so far targeting a given
+// destination buffer, plus that buffer's remote pointer (so the server, whose relay_generation
+// counter is scoped per-buffer -- see rpc_server_shared_state -- knows which of its buffers this
+// count is about). Keyed by the cached socket_t* rather than an endpoint string, since
+// ggml_backend_rpc_buffer_context only ever hands us the already-resolved shared_ptr (sockets are
+// cached 1:1 per endpoint by get_socket, so this is equivalent to keying by endpoint).
+// ggml_backend_rpc_graph_compute reads the current entry for its own destination and stamps it as
+// that call's wait_for_relay_buffer/wait_for_relay_generation. A destination that's never a relay
+// target (e.g. the first ring stage) simply never appears here, so its graph_compute calls carry
+// (0, 0) ("no wait needed").
+struct relay_gen_entry {
+    uint64_t dst_remote_ptr;
+    uint64_t generation;
+};
+static std::mutex g_relay_gen_mutex;
+static std::unordered_map<socket_t *, relay_gen_entry> g_relay_gen_sent;
+
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
     if (ggml_backend_buffer_is_rpc(src->buffer)) {
         // check if src and dst are on the same server
@@ -506,7 +568,36 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         ggml_backend_buffer_t dst_buffer = dst->buffer;
         ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *)dst_buffer->context;
         if (src_ctx->sock != dst_ctx->sock) {
-            return false;
+            if (!g_rpc_ring_relay_enabled) {
+                return false;
+            }
+            // ask src's server to ship the bytes directly to dst's server (its configured
+            // ring successor), bypassing this process entirely. One-way: the coordinator does not
+            // wait for the relay to land (see rpc_server_shared_state::relay_generation for how
+            // correctness is preserved without that wait).
+            rpc_msg_relay_tensor_req request;
+            request.src = serialize_tensor(src);
+            request.dst = serialize_tensor(dst);
+            bool status = send_rpc_cmd(src_ctx->sock, RPC_CMD_RELAY_TENSOR, &request, sizeof(request));
+            RPC_STATUS_ASSERT(status);
+            {
+                std::lock_guard<std::mutex> lock(g_relay_gen_mutex);
+                relay_gen_entry & entry = g_relay_gen_sent[dst_ctx->sock.get()];
+                // The destination buffer can be freed and reallocated mid-session (e.g.
+                // llama-bench tearing down and rebuilding compute buffers between a pp512 row and
+                // a tg128 row on the SAME connection/socket) -- the server's own relay_generation
+                // is keyed by buffer pointer precisely so a new buffer starts counting from zero
+                // (see rpc_server_shared_state's comment), but this count must restart too,
+                // otherwise we'd stamp a stale, carried-over generation number that the new
+                // buffer's counter on the server can never reach.
+                if (entry.dst_remote_ptr != dst_ctx->remote_ptr) {
+                    entry.dst_remote_ptr = dst_ctx->remote_ptr;
+                    entry.generation = 0;
+                }
+                entry.generation++;
+                LOG_DBG("[%s] issued relay #%" PRIu64 " to dst buffer=0x%" PRIx64 " on sock=%p (src sock=%p)\n", __func__, entry.generation, entry.dst_remote_ptr, (void*)dst_ctx->sock.get(), (void*)src_ctx->sock.get());
+            }
+            return true;
         }
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
         rpc_msg_copy_tensor_req request;
@@ -554,6 +645,17 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     if (response.remote_ptr != 0) {
+        // A new buffer object on this socket's server supersedes any relay-generation count we
+        // were tracking for it -- even though the ADDRESS this new buffer gets (response.remote_ptr)
+        // can turn out identical to a previous, already-freed buffer's address (a plain allocator
+        // reuse, e.g. llama-bench tearing down and rebuilding compute buffers between a pp512 row
+        // and a tg128 row), so comparing addresses for a change isn't a reliable signal. This is
+        // the one place the client unambiguously knows "a brand new buffer now exists here", so
+        // reset unconditionally rather than trying to detect the reuse after the fact.
+        {
+            std::lock_guard<std::mutex> lock(g_relay_gen_mutex);
+            g_relay_gen_sent.erase(sock.get());
+        }
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
             new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
@@ -669,7 +771,7 @@ static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, 
     tensors.push_back(serialize_tensor(tensor));
 }
 
-static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
+static void serialize_graph(uint32_t device, uint64_t wait_for_relay_buffer, uint64_t wait_for_relay_generation, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
     uint32_t n_nodes = cgraph->n_nodes;
     std::vector<rpc_tensor> tensors;
     std::unordered_set<ggml_tensor*> visited;
@@ -677,13 +779,17 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
         add_tensor(cgraph->nodes[i], tensors, visited);
     }
     // serialization format:
-    // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+    // | device (4 bytes) | wait_for_relay_buffer (8 bytes) | wait_for_relay_generation (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     uint32_t n_tensors = tensors.size();
-    int output_size = 2*sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
+    int output_size = 2*sizeof(uint32_t) + 2*sizeof(uint64_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
     output.resize(output_size, 0);
     uint8_t * dest = output.data();
     memcpy(dest, &device, sizeof(device));
     dest += sizeof(device);
+    memcpy(dest, &wait_for_relay_buffer, sizeof(wait_for_relay_buffer));
+    dest += sizeof(wait_for_relay_buffer);
+    memcpy(dest, &wait_for_relay_generation, sizeof(wait_for_relay_generation));
+    dest += sizeof(wait_for_relay_generation);
     memcpy(dest, &n_nodes, sizeof(n_nodes));
     dest += sizeof(n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
@@ -702,18 +808,35 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
+    auto sock = get_socket(rpc_ctx->endpoint);
+    // How many relays have been issued targeting this destination so far, and which of its
+    // buffers they targeted -- the scheduler always issues a split's cpy_tensor (which bumps this,
+    // if the copy crossed servers) immediately before that split's own graph_compute, so the
+    // count read here is exactly the generation this call's input depends on. Stays (0, 0) ("no
+    // wait needed") for a destination that's never a relay target.
+    uint64_t wait_for_relay_buffer = 0;
+    uint64_t wait_for_relay_generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_relay_gen_mutex);
+        auto it = g_relay_gen_sent.find(sock.get());
+        if (it != g_relay_gen_sent.end()) {
+            wait_for_relay_buffer     = it->second.dst_remote_ptr;
+            wait_for_relay_generation = it->second.generation;
+        }
+    }
+    LOG_DBG("[%s] endpoint=%s sock=%p wait_for_relay_buffer=0x%" PRIx64 " wait_for_relay_generation=%" PRIu64 "\n", __func__, rpc_ctx->endpoint.c_str(), (void*)sock.get(), wait_for_relay_buffer, wait_for_relay_generation);
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
-        auto sock = get_socket(rpc_ctx->endpoint);
+        request.wait_for_relay_buffer = wait_for_relay_buffer;
+        request.wait_for_relay_generation = wait_for_relay_generation;
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         std::vector<uint8_t> input;
-        serialize_graph(rpc_ctx->device, cgraph, input);
-        auto sock = get_socket(rpc_ctx->endpoint);
+        serialize_graph(rpc_ctx->device, wait_for_relay_buffer, wait_for_relay_generation, cgraph, input);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
         RPC_STATUS_ASSERT(status);
     }
@@ -816,10 +939,116 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 
 // RPC server-side implementation
 
+// Buffer bookkeeping shared by every connection served by one ggml_backend_rpc_start_server
+// process. This used to live as a private, per-connection set inside rpc_server, which was fine
+// as long as each server only ever served one connection at a time (the original, strictly
+// sequential accept loop). Serving connections concurrently (needed so a server can accept an
+// inbound ring-relay connection while still serving its primary one) breaks that: a buffer
+// allocated on one connection must still be a valid reference on every other connection to the
+// same process, e.g. when a relay's RPC_CMD_RELAY_SET_TENSOR references a tensor whose buffer was
+// allocated by the coordinator's own (separate) connection.
+struct rpc_server_shared_state {
+    std::mutex mutex;
+    std::unordered_set<ggml_backend_buffer_t> buffers;
+
+    void insert(ggml_backend_buffer_t buffer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        buffers.insert(buffer);
+    }
+    void erase(ggml_backend_buffer_t buffer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        buffers.erase(buffer);
+    }
+    bool contains(ggml_backend_buffer_t buffer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return buffers.find(buffer) != buffers.end();
+    }
+
+    // Ring-relay pipelining (see RPC_CMD_RELAY_SET_TENSOR / GRAPH_COMPUTE's
+    // wait_for_relay_generation field): this server's predecessor relays activation tensors to it
+    // over a connection that is entirely separate from the coordinator's own connection, which
+    // carries this server's GRAPH_COMPUTE calls. With both relay hops now fire-and-forget (no ack),
+    // nothing else guarantees a relayed tensor has actually landed before a dependent GRAPH_COMPUTE
+    // runs. relay_generation is bumped once, here, right after a RELAY_SET_TENSOR is fully applied;
+    // GRAPH_COMPUTE/GRAPH_RECOMPUTE block until it reaches the value the coordinator stamped on
+    // that call, moving the wait from the coordinator (Stage 1) to the actual consumer.
+    //
+    // Scoped PER DESTINATION BUFFER, not a single counter for the whole server process: this
+    // process keeps running and serving new connections across many separate coordinator sessions
+    // (e.g. repeated llama-bench invocations against the same already-launched ring), each of
+    // which allocates its own fresh buffer and starts counting relays from zero again on the
+    // client side. A single process-lifetime counter would desync from that -- after the first
+    // session, the server's counter is already well past whatever small number a brand new
+    // session's coordinator stamps, so every wait would be satisfied immediately without actually
+    // waiting for that session's own data to land. Keying by the buffer sidesteps this for free:
+    // a new session's buffer is a fresh pointer (the old one was already freed), so it naturally
+    // starts its own count at zero, exactly matching the client's.
+    std::condition_variable relay_cv;
+    std::unordered_map<ggml_backend_buffer_t, uint64_t> relay_generation;
+
+    // Guards the OTHER direction of the same race: a buffer is reused across ubatches (no real
+    // double-buffering -- see the plan's reasoning for why that's intentional here), so applying
+    // relay generation G+1's write can only be safe once generation G's data has actually been
+    // consumed. Without this, a predecessor that races far enough ahead (now possible, since
+    // neither relay hop nor GRAPH_COMPUTE blocks the sender any more) can land G+1's bytes in the
+    // same memory GRAPH_COMPUTE is still reading for G, on a different thread (relay applies run
+    // on their own per-connection thread, per the Stage 1 threaded-accept change) -- a genuine
+    // write-while-reading race, not just a "did the data arrive yet" ordering question. Bumped
+    // right after ggml_backend_graph_compute returns for a call that actually consumed from this
+    // buffer (wait_for_relay_buffer != 0); RELAY_SET_TENSOR's handler waits on it before applying.
+    std::unordered_map<ggml_backend_buffer_t, uint64_t> compute_done_generation;
+
+    void bump_relay_generation(ggml_backend_buffer_t buffer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        relay_generation[buffer]++;
+        relay_cv.notify_all();
+    }
+
+    void bump_compute_done_generation(ggml_backend_buffer_t buffer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        compute_done_generation[buffer]++;
+        relay_cv.notify_all();
+    }
+
+    uint64_t get_relay_generation(ggml_backend_buffer_t buffer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return relay_generation[buffer];
+    }
+
+    // Returns false on timeout (caller should treat this as a clean failure, not retry forever --
+    // most likely cause is a dead/unreachable ring predecessor).
+    bool wait_for_relay_generation(ggml_backend_buffer_t buffer, uint64_t target) {
+        if (target == 0) {
+            return true;
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        return relay_cv.wait_for(lock, std::chrono::seconds(30), [&] { return relay_generation[buffer] >= target; });
+    }
+
+    // Returns false on timeout. See compute_done_generation's comment above for why this wait
+    // exists: it throttles how far ahead of this buffer's actual consumer a relay write may land.
+    bool wait_for_compute_done_generation(ggml_backend_buffer_t buffer, uint64_t target) {
+        if (target == 0) {
+            return true;
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        return relay_cv.wait_for(lock, std::chrono::seconds(30), [&] { return compute_done_generation[buffer] >= target; });
+    }
+
+    // Called alongside erase(buffer) when a buffer is freed, so this map doesn't grow unbounded
+    // across many sessions' worth of distinct buffer pointers served by one long-lived process.
+    void erase_relay_generation(ggml_backend_buffer_t buffer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        relay_generation.erase(buffer);
+        compute_done_generation.erase(buffer);
+    }
+};
+
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
+    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir,
+               rpc_server_shared_state & shared, std::string ring_next_endpoint = "")
+        : backends(std::move(all_backends)), cache_dir(cache_dir), shared(shared), ring_next_endpoint(std::move(ring_next_endpoint)) {
         stored_graphs.resize(backends.size());
     }
     ~rpc_server();
@@ -831,10 +1060,11 @@ public:
     bool buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response);
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
-    bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor(const std::vector<uint8_t> & input, ggml_backend_buffer_t * out_buffer = nullptr);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
+    bool relay_tensor(const rpc_msg_relay_tensor_req & request);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
@@ -857,9 +1087,28 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
-    std::unordered_set<ggml_backend_buffer_t> buffers;
+    rpc_server_shared_state & shared;
+    // buffers allocated by THIS connection specifically (as opposed to `shared`, which tracks
+    // every buffer known to the whole process): used only to free them when this connection ends,
+    // mirroring the original per-connection cleanup-on-disconnect behavior. A buffer allocated by
+    // a different connection (e.g. the coordinator's) must never be freed just because some other
+    // connection -- a relay hop, say -- happens to close.
+    std::unordered_set<ggml_backend_buffer_t> owned_buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+    // ring-relay extension: this server's configured successor, set via --ring-next /
+    // ggml_backend_rpc_set_ring_next. Empty if ring relay isn't used by this server.
+    std::string ring_next_endpoint;
+    // Keeps relay_tensor()'s connection to ring_next_endpoint alive across calls for this
+    // connection's lifetime, instead of letting get_socket's cache reconnect fresh every single
+    // relay (which it otherwise would -- nothing else holds a strong reference to that socket).
+    // Without this, consecutive relays to the same successor travel over DIFFERENT TCP
+    // connections, each handled by its own accept-spawned thread with no ordering relationship to
+    // the others -- generation G+1's bytes could then land before, or concurrently with, G's, no
+    // matter what the relay_generation/compute_done_generation counters say. Reusing one
+    // connection restores the same "single connection = strict order, one thread at a time"
+    // guarantee the rest of this design already relies on everywhere else.
+    std::shared_ptr<socket_t> ring_next_sock;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -923,7 +1172,8 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
         response.remote_size = buffer->size;
         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
             __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
-        buffers.insert(buffer);
+        shared.insert(buffer);
+        owned_buffers.insert(buffer);
     } else {
         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
     }
@@ -957,7 +1207,7 @@ bool rpc_server::get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_
 bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (buffers.find(buffer) == buffers.end()) {
+    if (!shared.contains(buffer)) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
@@ -969,19 +1219,21 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (buffers.find(buffer) == buffers.end()) {
+    if (!shared.contains(buffer)) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
     ggml_backend_buffer_free(buffer);
-    buffers.erase(buffer);
+    shared.erase(buffer);
+    shared.erase_relay_generation(buffer);
+    owned_buffers.erase(buffer);
     return true;
 }
 
 bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (buffers.find(buffer) == buffers.end()) {
+    if (!shared.contains(buffer)) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
@@ -1015,7 +1267,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->nb[i] = tensor->nb[i];
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
-    if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
+    if (result->buffer && !shared.contains(result->buffer)) {
         result->buffer = nullptr;
     }
 
@@ -1039,7 +1291,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 }
 
 
-bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+bool rpc_server::set_tensor(const std::vector<uint8_t> & input, ggml_backend_buffer_t * out_buffer) {
     // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
     if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
         return false;
@@ -1061,6 +1313,9 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     if (tensor == nullptr || tensor->buffer == nullptr) {
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
+    }
+    if (out_buffer) {
+        *out_buffer = tensor->buffer;
     }
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n", __func__, (void*)tensor->buffer, tensor->data, offset, size);
 
@@ -1264,6 +1519,79 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     return true;
 }
 
+bool rpc_server::relay_tensor(const rpc_msg_relay_tensor_req & request) {
+    if (ring_next_endpoint.empty()) {
+        GGML_LOG_ERROR("[%s] no ring-next endpoint configured on this server (missing --ring-next)\n", __func__);
+        return false;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * src = deserialize_tensor(ctx, &request.src);
+    if (src == nullptr || src->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing src tensor\n", __func__);
+        return false;
+    }
+
+    const size_t size = ggml_nbytes(src);
+
+    // sanitize src->data, same pattern as rpc_server::get_tensor
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(src->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(src->buffer);
+        const size_t src_data = (size_t) src->data;
+
+        if (src_data < p0 || src_data >= p1 || size > (p1 - src_data)) {
+            GGML_LOG_ERROR("[%s] src tensor region (data=0x%zx, size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
+                           __func__, src_data, size, p0, p1);
+            return false;
+        }
+    }
+
+    std::vector<uint8_t> tensor_data(size);
+    ggml_backend_tensor_get(src, tensor_data.data(), 0, size);
+
+    // build the exact wire payload rpc_server::set_tensor() expects on the successor:
+    // | rpc_tensor(dst) | offset=0 (8 bytes) | data (size bytes) |
+    std::vector<uint8_t> payload(sizeof(rpc_tensor) + sizeof(uint64_t) + size);
+    const uint64_t offset = 0;
+    memcpy(payload.data(), &request.dst, sizeof(rpc_tensor));
+    memcpy(payload.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+    if (size > 0) {
+        memcpy(payload.data() + sizeof(rpc_tensor) + sizeof(offset), tensor_data.data(), size);
+    }
+
+    auto next_sock = get_socket(ring_next_endpoint);
+    if (!next_sock) {
+        GGML_LOG_ERROR("[%s] failed to connect to ring successor %s\n", __func__, ring_next_endpoint.c_str());
+        return false;
+    }
+    // Keep this connection alive past this call -- see ring_next_sock's comment. get_socket's own
+    // cache is weak_ptr-based (by design, for the normal client-buffer-context use case), so
+    // without some strong reference surviving between calls it reconnects fresh every single
+    // relay, which breaks ordering across relays to the same successor.
+    ring_next_sock = next_sock;
+    // One-way, like plain SET_TENSOR: we no longer wait for the successor to apply this before
+    // returning. Correctness doesn't need that wait any more -- the successor bumps its own
+    // relay_generation after applying the write, and that's what its GRAPH_COMPUTE/GRAPH_RECOMPUTE
+    // handlers actually block on (see rpc_server_shared_state). Waiting here would just reintroduce
+    // the round trip Stage 2 removes.
+    bool status = send_rpc_cmd(next_sock, RPC_CMD_RELAY_SET_TENSOR, payload.data(), payload.size());
+    if (!status) {
+        GGML_LOG_ERROR("[%s] relay send to %s failed\n", __func__, ring_next_endpoint.c_str());
+        return false;
+    }
+
+    LOG_DBG("[%s] relayed %zu bytes to %s\n", __func__, size, ring_next_endpoint.c_str());
+    return true;
+}
+
 ggml_tensor * rpc_server::create_node(uint64_t id,
                                       struct ggml_context * ctx,
                                       const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
@@ -1322,8 +1650,8 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     // serialization format:
-    // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
-    if (input.size() < 2*sizeof(uint32_t)) {
+    // | device (4 bytes) | wait_for_relay_buffer (8 bytes) | wait_for_relay_generation (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+    if (input.size() < 2*sizeof(uint32_t) + 2*sizeof(uint64_t)) {
         return false;
     }
     const uint8_t * src = input.data();
@@ -1333,10 +1661,21 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     if (device >= backends.size()) {
         return false;
     }
+    uint64_t wait_for_relay_buffer;
+    memcpy(&wait_for_relay_buffer, src, sizeof(wait_for_relay_buffer));
+    src += sizeof(wait_for_relay_buffer);
+    uint64_t wait_for_relay_generation;
+    memcpy(&wait_for_relay_generation, src, sizeof(wait_for_relay_generation));
+    src += sizeof(wait_for_relay_generation);
+    LOG_DBG("[%s] device=%u wait_for_relay_buffer=0x%" PRIx64 " wait_for_relay_generation=%" PRIu64 "\n", __func__, device, wait_for_relay_buffer, wait_for_relay_generation);
+    if (!shared.wait_for_relay_generation(reinterpret_cast<ggml_backend_buffer_t>(wait_for_relay_buffer), wait_for_relay_generation)) {
+        GGML_LOG_ERROR("[%s] timed out waiting for relay generation %" PRIu64 "\n", __func__, wait_for_relay_generation);
+        return false;
+    }
     uint32_t n_nodes;
     memcpy(&n_nodes, src, sizeof(n_nodes));
     src += sizeof(n_nodes);
-    if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
+    if (input.size() < 2*sizeof(uint32_t) + 2*sizeof(uint64_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
         return false;
     }
     const uint64_t * nodes = (const uint64_t *)src;
@@ -1344,7 +1683,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     uint32_t n_tensors;
     memcpy(&n_tensors, src, sizeof(n_tensors));
     src += sizeof(n_tensors);
-    if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) + n_tensors*sizeof(rpc_tensor)) {
+    if (input.size() < 2*sizeof(uint32_t) + 2*sizeof(uint64_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) + n_tensors*sizeof(rpc_tensor)) {
         return false;
     }
     const rpc_tensor * tensors = (const rpc_tensor *)src;
@@ -1386,6 +1725,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (wait_for_relay_buffer) {
+        shared.bump_compute_done_generation(reinterpret_cast<ggml_backend_buffer_t>(wait_for_relay_buffer));
+    }
     stored_graphs[device].graph = graph;
     return true;
 }
@@ -1398,10 +1740,18 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     if (stored_graphs[device].graph == nullptr) {
         return false;
     }
+    LOG_DBG("[%s] device=%u wait_for_relay_buffer=0x%" PRIx64 " wait_for_relay_generation=%" PRIu64 "\n", __func__, device, request.wait_for_relay_buffer, request.wait_for_relay_generation);
+    if (!shared.wait_for_relay_generation(reinterpret_cast<ggml_backend_buffer_t>(request.wait_for_relay_buffer), request.wait_for_relay_generation)) {
+        GGML_LOG_ERROR("[%s] timed out waiting for relay generation %" PRIu64 "\n", __func__, request.wait_for_relay_generation);
+        return false;
+    }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (request.wait_for_relay_buffer) {
+        shared.bump_compute_done_generation(reinterpret_cast<ggml_backend_buffer_t>(request.wait_for_relay_buffer));
+    }
     return true;
 }
 
@@ -1420,14 +1770,17 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
-    for (auto buffer : buffers) {
+    // only free buffers this connection itself allocated -- see owned_buffers' comment.
+    for (auto buffer : owned_buffers) {
+        shared.erase(buffer);
+        shared.erase_relay_generation(buffer);
         ggml_backend_buffer_free(buffer);
     }
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock) {
-    rpc_server server(backends, cache_dir);
+                             socket_ptr sock, rpc_server_shared_state & shared, const std::string & ring_next_endpoint) {
+    rpc_server server(backends, cache_dir, shared, ring_next_endpoint);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -1650,6 +2003,56 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_RELAY_SET_TENSOR: {
+                // Identical wire payload and server-side effect as RPC_CMD_SET_TENSOR, and now
+                // one-way too (see rpc_msg_relay_set_tensor_rsp's old comment, now removed, for
+                // why this used to be acknowledged). Correctness instead comes from bumping
+                // relay_generation here, right after the write lands -- GRAPH_COMPUTE/
+                // GRAPH_RECOMPUTE on this server's *other* connection (the coordinator's) block on
+                // this, so they never run ahead of data that arrives on this separate connection.
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                // The other half of that same race, in reverse: this buffer has no real double
+                // buffering, so applying THIS write must wait until whatever GRAPH_COMPUTE/
+                // GRAPH_RECOMPUTE is still reading the PREVIOUS generation's data out of it has
+                // finished -- otherwise a predecessor racing far enough ahead could overwrite data
+                // out from under a compute that's still in flight on a different thread. Peek the
+                // destination buffer (same field layout set_tensor() itself parses) before
+                // applying, so we know which buffer's compute_done_generation to wait on.
+                if (input.size() >= sizeof(rpc_tensor) + sizeof(uint64_t)) {
+                    const rpc_tensor * dst_tensor = (const rpc_tensor *)input.data();
+                    ggml_backend_buffer_t peek_buffer = reinterpret_cast<ggml_backend_buffer_t>(dst_tensor->buffer);
+                    if (shared.contains(peek_buffer)) {
+                        uint64_t prev_generation = shared.get_relay_generation(peek_buffer);
+                        if (!shared.wait_for_compute_done_generation(peek_buffer, prev_generation)) {
+                            GGML_LOG_ERROR("[RPC_CMD_RELAY_SET_TENSOR] timed out waiting for compute to finish consuming generation %" PRIu64 "\n", prev_generation);
+                            return;
+                        }
+                    }
+                }
+                ggml_backend_buffer_t dst_buffer = nullptr;
+                if (!server.set_tensor(input, &dst_buffer)) {
+                    return;
+                }
+                shared.bump_relay_generation(dst_buffer);
+                LOG_DBG("[RPC_CMD_RELAY_SET_TENSOR] applied to buffer %p\n", (void*)dst_buffer);
+                break;
+            }
+            case RPC_CMD_RELAY_TENSOR: {
+                // One-way: the coordinator does not wait for this relay to land (see
+                // ggml_backend_rpc_buffer_cpy_tensor's relay branch and
+                // rpc_server_shared_state::relay_generation).
+                rpc_msg_relay_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.relay_tensor(request)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GRAPH_COMPUTE: {
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
@@ -1690,6 +2093,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
         }
     }
+}
+
+// Ring-relay extension: this server's configured ring successor, set by the operator (via
+// rpc-server's --ring-next, or directly by an embedder) before ggml_backend_rpc_start_server is
+// called. Empty means this server never relays (RPC_CMD_RELAY_TENSOR requests will fail).
+static std::string g_rpc_ring_next_endpoint;
+
+void ggml_backend_rpc_set_ring_next(const char * endpoint) {
+    g_rpc_ring_next_endpoint = endpoint ? endpoint : "";
 }
 
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
@@ -1747,6 +2159,15 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
+    // Shared across every connection this process serves -- see rpc_server_shared_state's comment
+    // for why a buffer allocated on one connection must still be valid when referenced by another.
+    rpc_server_shared_state shared_state;
+    // Each connection is served on its own thread: a server with a ring successor configured
+    // (--ring-next) must be able to accept an inbound relay connection from its ring predecessor
+    // while it's still busy serving its primary (coordinator) connection -- a strictly sequential
+    // accept loop would deadlock, since the predecessor's connect() would never be accepted until
+    // the primary connection closes. This is a pure concurrency improvement: a single client's
+    // behavior is unaffected, it simply gets its own thread instead of blocking the accept loop.
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
@@ -1755,9 +2176,11 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket);
-        printf("Client connection closed\n");
-        fflush(stdout);
+        std::thread([&backends, cache_dir, client_socket, &shared_state]() {
+            rpc_serve_client(backends, cache_dir, client_socket, shared_state, g_rpc_ring_next_endpoint);
+            printf("Client connection closed\n");
+            fflush(stdout);
+        }).detach();
     }
     rpc_transport_shutdown();
     for (auto backend : backends) {
@@ -1886,6 +2309,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_set_ring_relay") == 0) {
+        return (void *)ggml_backend_rpc_set_ring_relay;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_set_ring_next") == 0) {
+        return (void *)ggml_backend_rpc_set_ring_next;
     }
     return NULL;
 

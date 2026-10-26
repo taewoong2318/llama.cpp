@@ -30,6 +30,21 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
 
+// Ring-relay extension (opt-in, off by default -- plain --rpc usage is unaffected unless both
+// sides of a pair are explicitly configured for it):
+//
+// Client side: when enabled, a cross-server tensor copy (e.g. at a ggml_backend_sched split
+// boundary) is relayed directly between the two RPC servers instead of round-tripping the bytes
+// through this process via get_tensor+set_tensor.
+GGML_BACKEND_API void ggml_backend_rpc_set_ring_relay(bool enabled);
+
+// Server side only: configures this rpc-server instance's ring successor endpoint (host:port),
+// so it can act on RPC_CMD_RELAY_TENSOR requests by forwarding tensor bytes straight to that
+// peer. Must be called before ggml_backend_rpc_start_server(). Static ring topology: the operator
+// configures each server's successor at launch, mirroring how pp-stage's --next-host/--next-port
+// work today -- there is no runtime neighbor-discovery protocol.
+GGML_BACKEND_API void ggml_backend_rpc_set_ring_next(const char * endpoint);
+
 #ifdef  __cplusplus
 }
 #endif

@@ -935,6 +935,20 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
     return devices;
 }
 
+static void enable_rpc_ring_relay() {
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::invalid_argument("failed to find RPC backend");
+    }
+    typedef void (*ggml_backend_rpc_set_ring_relay_t)(bool enabled);
+    ggml_backend_rpc_set_ring_relay_t ggml_backend_rpc_set_ring_relay_fn = (ggml_backend_rpc_set_ring_relay_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_set_ring_relay");
+    if (!ggml_backend_rpc_set_ring_relay_fn) {
+        throw std::invalid_argument("failed to find RPC set ring-relay function");
+    }
+    ggml_backend_rpc_set_ring_relay_fn(true);
+}
+
 static void add_rpc_devices(const std::string & servers) {
     auto rpc_servers = string_split<std::string>(servers, ',');
     if (rpc_servers.empty()) {
@@ -2381,6 +2395,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 GGML_UNUSED(params);
             }
         ).set_env("LLAMA_ARG_RPC"));
+        add_opt(common_arg(
+            {"--rpc-ring"},
+            "relay cross-server tensor copies directly between RPC servers instead of through "
+            "this process (requires each server to be started with its own --ring-next)",
+            [](common_params & params) {
+                enable_rpc_ring_relay();
+                GGML_UNUSED(params);
+            }
+        ).set_env("LLAMA_ARG_RPC_RING"));
     }
     add_opt(common_arg(
         {"--mlock"},

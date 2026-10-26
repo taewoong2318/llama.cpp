@@ -175,6 +175,7 @@ struct rpc_server_params {
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
+    std::string              ring_next;  // ring-relay extension: this server's successor (host:port)
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -186,6 +187,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  --ring-next HOST:PORT            this server's ring successor, for ring-relay mode\n");
     fprintf(stderr, "\n");
 }
 
@@ -233,6 +235,11 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "--ring-next") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.ring_next = argv[i];
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -335,6 +342,16 @@ int main(int argc, char * argv[]) {
     if (!start_server_fn) {
         fprintf(stderr, "Failed to obtain RPC backend start server function\n");
         return 1;
+    }
+
+    if (!params.ring_next.empty()) {
+        auto set_ring_next_fn = (decltype(ggml_backend_rpc_set_ring_next)*) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_set_ring_next");
+        if (!set_ring_next_fn) {
+            fprintf(stderr, "Failed to obtain RPC backend set ring-next function\n");
+            return 1;
+        }
+        set_ring_next_fn(params.ring_next.c_str());
+        printf("  ring successor : %s\n", params.ring_next.c_str());
     }
 
     start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());

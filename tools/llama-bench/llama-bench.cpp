@@ -172,6 +172,20 @@ static std::vector<ggml_backend_dev_t> parse_devices_arg(const std::string & val
     return devices;
 }
 
+static void enable_rpc_ring_relay() {
+    auto * rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::invalid_argument("failed to find RPC backend");
+    }
+
+    using set_ring_relay_fn = void (*)(bool enabled);
+    auto * ggml_backend_rpc_set_ring_relay_fn = (set_ring_relay_fn) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_set_ring_relay");
+    if (!ggml_backend_rpc_set_ring_relay_fn) {
+        throw std::invalid_argument("failed to find RPC set ring-relay function");
+    }
+    ggml_backend_rpc_set_ring_relay_fn(true);
+}
+
 static void register_rpc_server_list(const std::string & servers) {
     auto rpc_servers = string_split<std::string>(servers, ',');
     if (rpc_servers.empty()) {
@@ -427,6 +441,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
+        printf("  --rpc-ring                                  relay cross-server tensor copies directly between RPC servers\n");
     }
     printf("\n");
     printf("test parameters:\n");
@@ -735,6 +750,14 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 try {
                     register_rpc_server_list(argv[i]);
+                } catch (const std::exception & e) {
+                    fprintf(stderr, "error: %s\n", e.what());
+                    invalid_param = true;
+                    break;
+                }
+            } else if (llama_supports_rpc() && arg == "--rpc-ring") {
+                try {
+                    enable_rpc_ring_relay();
                 } catch (const std::exception & e) {
                     fprintf(stderr, "error: %s\n", e.what());
                     invalid_param = true;
