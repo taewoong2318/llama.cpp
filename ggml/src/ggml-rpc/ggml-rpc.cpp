@@ -1027,8 +1027,9 @@ struct rpc_server_shared_state {
     // same memory GRAPH_COMPUTE is still reading for G, on a different thread (relay applies run
     // on their own per-connection thread, per the Stage 1 threaded-accept change) -- a genuine
     // write-while-reading race, not just a "did the data arrive yet" ordering question. Bumped
-    // right after ggml_backend_graph_compute returns for a call that actually consumed from this
-    // buffer (wait_for_relay_buffer != 0); RELAY_SET_TENSOR's handler waits on it before applying.
+    // once a call that actually consumed from this buffer (wait_for_relay_buffer != 0) is done
+    // with it -- including, on a relaying server, the outgoing relay of its output (see
+    // rpc_server::pending_compute_done); RELAY_SET_TENSOR's handler waits on it before applying.
     std::unordered_map<ggml_backend_buffer_t, uint64_t> compute_done_generation;
 
     void bump_relay_generation(ggml_backend_buffer_t buffer) {
@@ -1098,6 +1099,7 @@ public:
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool relay_tensor(const rpc_msg_relay_tensor_req & request);
+    void flush_compute_done();
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
@@ -1142,7 +1144,31 @@ private:
     // connection restores the same "single connection = strict order, one thread at a time"
     // guarantee the rest of this design already relies on everywhere else.
     std::shared_ptr<socket_t> ring_next_sock;
+    // On a relaying server, compute_done for a buffer is deferred until the following
+    // RELAY_TENSOR has copied out its source: the allocator may place this stage's output in the
+    // same memory as its relayed input, so the next relay must not land before the output is read.
+    ggml_backend_buffer_t pending_compute_done = nullptr;
+    void mark_compute_done(uint64_t buffer);
 };
+
+void rpc_server::mark_compute_done(uint64_t buffer) {
+    if (!buffer) {
+        return;
+    }
+    flush_compute_done();
+    if (ring_next_endpoint.empty()) {
+        shared.bump_compute_done_generation(reinterpret_cast<ggml_backend_buffer_t>(buffer));
+    } else {
+        pending_compute_done = reinterpret_cast<ggml_backend_buffer_t>(buffer);
+    }
+}
+
+void rpc_server::flush_compute_done() {
+    if (pending_compute_done) {
+        shared.bump_compute_done_generation(pending_compute_done);
+        pending_compute_done = nullptr;
+    }
+}
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
@@ -1589,6 +1615,7 @@ bool rpc_server::relay_tensor(const rpc_msg_relay_tensor_req & request) {
 
     std::vector<uint8_t> tensor_data(size);
     ggml_backend_tensor_get(src, tensor_data.data(), 0, size);
+    flush_compute_done();
 
     // build the exact wire payload rpc_server::set_tensor() expects on the successor:
     // | rpc_tensor(dst) | offset=0 (8 bytes) | data (size bytes) |
@@ -1758,9 +1785,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
-    if (wait_for_relay_buffer) {
-        shared.bump_compute_done_generation(reinterpret_cast<ggml_backend_buffer_t>(wait_for_relay_buffer));
-    }
+    mark_compute_done(wait_for_relay_buffer);
     stored_graphs[device].graph = graph;
     return true;
 }
@@ -1782,9 +1807,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     LOG_DBG("[%s] device: %u\n", __func__, device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
-    if (request.wait_for_relay_buffer) {
-        shared.bump_compute_done_generation(reinterpret_cast<ggml_backend_buffer_t>(request.wait_for_relay_buffer));
-    }
+    mark_compute_done(request.wait_for_relay_buffer);
     return true;
 }
 
@@ -1803,6 +1826,7 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    flush_compute_done();
     // only free buffers this connection itself allocated -- see owned_buffers' comment.
     for (auto buffer : owned_buffers) {
         shared.erase(buffer);
@@ -1858,6 +1882,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             // fail fast if the command is invalid
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
+        }
+        if (cmd != RPC_CMD_RELAY_TENSOR) {
+            server.flush_compute_done();
         }
         switch (cmd) {
             case RPC_CMD_HELLO: {
