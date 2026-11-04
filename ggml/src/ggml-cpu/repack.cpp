@@ -4945,18 +4945,22 @@ class tensor_traits_i2s : public ggml::cpu::tensor_traits {
                 }
             }
 
-            // GEMV: remaining columns
-            for (int64_t col = n_gemm_cols; col < ne11; col++) {
-                ggml_gemv_i2_i8_s(ne00, tmp, ne01,
+            // GEMV: batch the remaining (< 4) columns into a single call, reusing
+            // each weight row's unpacked bits across all of them.
+            const int64_t n_gemv_cols = ne11 - n_gemm_cols;
+            if (n_gemv_cols > 0) {
+                ggml_gemv_i2_i8_s(ne00, tmp, n_rows,
                     weight_data,
-                    pw + col * i8s_row_size,
-                    1, n_rows);
+                    pw + n_gemm_cols * i8s_row_size,
+                    (int)n_gemv_cols, n_rows);
 
-                float * dst_ptr = (float *)((char *)dst->data + col * nb1 + i12 * nb2) + src0_start;
-                const float post_scale = ws / act_scales[col];
-                const int32_t asum = act_sums[col];
-                for (int64_t row = 0; row < n_rows; row++) {
-                    dst_ptr[row] = (tmp[row] - asum) * post_scale;
+                for (int64_t col = 0; col < n_gemv_cols; col++) {
+                    float * dst_ptr = (float *)((char *)dst->data + (n_gemm_cols + col) * nb1 + i12 * nb2) + src0_start;
+                    const float post_scale = ws / act_scales[n_gemm_cols + col];
+                    const int32_t asum = act_sums[n_gemm_cols + col];
+                    for (int64_t row = 0; row < n_rows; row++) {
+                        dst_ptr[row] = (tmp[col * n_rows + row] - asum) * post_scale;
+                    }
                 }
             }
         }

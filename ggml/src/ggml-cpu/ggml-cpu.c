@@ -1531,20 +1531,26 @@ UseGgmlGemm2:;
             }
         }
 
-        // GEMV path: process remaining columns one by one
+        // GEMV path: batch the remaining (< 4) columns into a single call, reusing
+        // each weight row's unpacked bits across all of them instead of re-reading
+        // the weight range once per column.
         {
-            float * tmp = (float *)alloca(n_rows * sizeof(float));
-            for (int64_t iter = (ne11 >= 4 ? ne11 - ne11 % 4 : 0); iter < ne11; iter++) {
-                ggml_gemv_i2_i8_s(ne00, tmp, ne01,
+            const int64_t gemv_start  = (ne11 >= 4 ? ne11 - ne11 % 4 : 0);
+            const int64_t n_gemv_cols = ne11 - gemv_start;
+            if (n_gemv_cols > 0) {
+                float * tmp = (float *)alloca(n_rows * n_gemv_cols * sizeof(float));
+                ggml_gemv_i2_i8_s(ne00, tmp, n_rows,
                     (const char *)src0->data + src0_start * nb01 / 4,
-                    (const char *)src1_wdata + src1_col_stride * iter,
-                    1, n_rows);
+                    (const char *)src1_wdata + src1_col_stride * gemv_start,
+                    (int)n_gemv_cols, n_rows);
 
-                float * dst_row = (float *)((char *)dst->data + iter * nb1) + src0_start;
-                const float post_scale = ws / act_scales[iter];
-                const int32_t asum = act_sums[iter];
-                for (int64_t row = 0; row < n_rows; row++) {
-                    dst_row[row] = (tmp[row] - asum) * post_scale;
+                for (int64_t col = 0; col < n_gemv_cols; col++) {
+                    float * dst_row = (float *)((char *)dst->data + (gemv_start + col) * nb1) + src0_start;
+                    const float post_scale = ws / act_scales[gemv_start + col];
+                    const int32_t asum = act_sums[gemv_start + col];
+                    for (int64_t row = 0; row < n_rows; row++) {
+                        dst_row[row] = (tmp[col * n_rows + row] - asum) * post_scale;
+                    }
                 }
             }
         }
