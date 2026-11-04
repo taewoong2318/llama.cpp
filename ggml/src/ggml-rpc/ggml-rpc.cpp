@@ -719,11 +719,44 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             request.srcs[i] = serialize_tensor(tensor->src[i]);
         }
 
-        // TODO: cache the alloc responses to avoid extra RPC calls?
+        // The answer depends only on shape/type/op (and whether a buffer is attached), so cache it:
+        // the round trip queues behind every command already in flight on this socket, which
+        // stalls the client until the server drains its backlog (a full pipeline drain in ring mode).
+        rpc_msg_get_alloc_size_req key = request;
+        auto normalize = [](rpc_tensor & t) {
+            const bool present = t.id != 0;
+            t.id        = present;
+            t.buffer    = t.buffer != 0;
+            t.data      = 0;
+            t.view_src  = 0;
+            t.view_offs = 0;
+            memset(t.src, 0, sizeof(t.src));
+            memset(t.name, 0, sizeof(t.name));
+            memset(t.padding, 0, sizeof(t.padding));
+        };
+        normalize(key.tensor);
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            normalize(key.srcs[i]);
+        }
+        std::string cache_key = buft_ctx->endpoint;
+        cache_key.append((const char *) &key, sizeof(key));
+
+        static std::mutex cache_mutex;
+        static std::unordered_map<std::string, size_t> cache;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            auto it = cache.find(cache_key);
+            if (it != cache.end()) {
+                return it->second;
+            }
+        }
+
         rpc_msg_get_alloc_size_rsp response;
         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
 
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache[cache_key] = response.alloc_size;
         return response.alloc_size;
     }
 
