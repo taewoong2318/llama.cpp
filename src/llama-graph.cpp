@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-ppv.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1866,6 +1867,9 @@ llm_graph_qkv llm_graph_context::build_qkv(
     const int64_t n_embd_q = n_embd_head_q * n_head_q;
     const int64_t n_embd_k = n_embd_head_k * n_head_k;
 
+    // token count from the input (not the ubatch): PPV computes a single row of a larger ubatch
+    const int64_t n_tokens = cur->ne[1];
+
     ggml_tensor * Qcur, * Kcur, * Vcur;
 
     if (layer.wqkv) {
@@ -3411,8 +3415,14 @@ ggml_tensor * llm_graph_context::build_attn(
         v = mctx_cur->get_v(ctx0, il);
     }
 
-    const auto & kq_mask = inp->self_attn_mask.raw;
-    const auto & kv_rows = inp->self_attn_mask.rows;
+    ggml_tensor * kq_mask = inp->self_attn_mask.raw;
+    const auto  & kv_rows = inp->self_attn_mask.rows;
+
+    if (const int32_t row = llama_ppv_get_row(); row >= 0 && q->ne[2] == 1 && kq_mask->ne[1] > 1) {
+        // PPV: this rank computes only token `row` of the ubatch -> use that row of the mask
+        GGML_ASSERT(!cparams.flash_attn && kv_rows == nullptr && kq_mask->ne[3] == 1);
+        kq_mask = ggml_view_2d(ctx0, kq_mask, kq_mask->ne[0], 1, kq_mask->nb[1], row*kq_mask->nb[1]);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);

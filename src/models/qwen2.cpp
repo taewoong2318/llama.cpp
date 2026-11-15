@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-ppv.h"
 
 void llama_model_qwen2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -66,7 +67,17 @@ llama_model_qwen2::graph::graph(const llm_graph_params & params) : llm_graph_con
 
     auto * inp_attn = build_attn_inp_kv();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // PPV: every rank gets the same ubatch of `world` tokens but computes only token `ppv_row`;
+    // the K/V of all tokens are all-gathered per layer (see llama-ppv.h)
+    const int32_t ppv_row = llama_ppv_get_row();
+    const bool    ppv     = ppv_row >= 0 && n_tokens == llama_ppv_get_world() && n_tokens > 1;
+    if (ppv) {
+        inpL    = ggml_view_2d(ctx0, inpL, n_embd, 1, inpL->nb[1], ppv_row*inpL->nb[1]);
+        inp_pos = ggml_view_1d(ctx0, inp_pos, 1, ppv_row*ggml_element_size(inp_pos));
+    }
+
+    // PPV: the single computed row is the only output (the caller marks only token ppv_row)
+    ggml_tensor * inp_out_ids = ppv ? nullptr : build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -85,6 +96,16 @@ llama_model_qwen2::graph::graph(const llm_graph_params & params) : llm_graph_con
 
             Qcur = build_rope(Qcur, inp_pos, il);
             Kcur = build_rope(Kcur, inp_pos, il);
+
+            if (ppv) {
+                // all-gather this layer's new K/V rows; every rank then stores all of them in its cache
+                ggml_tensor * kv = llama_ppv_gather_kv(ctx0, ggml_cont(ctx0, Kcur), ggml_cont(ctx0, Vcur));
+                const int64_t n_k = n_embd_head*n_head_kv;
+                Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, kv, n_k, n_tokens, kv->nb[1], 0));
+                Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, kv, n_k, n_tokens, kv->nb[1], n_k*ggml_element_size(kv)));
+                Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+                Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+            }
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);

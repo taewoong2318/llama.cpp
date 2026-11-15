@@ -1745,6 +1745,21 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    //
+    // Position-parallel verification (experimental, see src/llama-ppv.h)
+    //
+
+    // connect the TCP mesh from LLAMA_PPV_PEERS / LLAMA_PPV_RANK; false if PPV is not configured
+    LLAMA_API bool    llama_ppv_init_from_env(void);
+    LLAMA_API int32_t llama_ppv_get_rank(void);
+    LLAMA_API int32_t llama_ppv_get_world(void);
+    // row (token index in the ubatch) this rank computes in PPV decodes; -1 = off
+    LLAMA_API void    llama_ppv_set_row(int32_t row);
+    LLAMA_API int32_t llama_ppv_get_row(void);
+    // all-gather n bytes from every rank into dst (world * n bytes, rank order)
+    LLAMA_API void    llama_ppv_allgather(const void * src, size_t n, void * dst);
+    LLAMA_API void    llama_ppv_stats(int64_t * n_rounds, double * wait_ms);
+
 #ifdef __cplusplus
 }
 #endif
