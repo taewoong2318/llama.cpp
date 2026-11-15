@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "llama-dist-attn.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -2382,6 +2384,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il) const {
+    if (q->ne[2] == 1 && k->ne[3] == 1 && !kq_b && !sinks && !v_mla && kq_mask &&
+        !hparams.attn_soft_cap && llama_dist_attn_enabled()) {
+        ggml_tensor * cur = llama_dist_attn(ctx0, q, k, v, kq_mask, kq_scale);
+        cb(cur, "dist_attn", il);
+        ggml_build_forward_expand(gf, cur);
+        return cur;
+    }
+
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
