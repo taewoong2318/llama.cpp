@@ -2,6 +2,7 @@
 // Extracted from ggml-aarch64.c
 
 #include "ggml-quants.h"
+#include "ggml-cpu-i2s.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -591,3 +592,172 @@ void ggml_gemv_i2_i8_s_interleaved(int n, float * GGML_RESTRICT s, size_t bs,
     // GEMV is just GEMM with nr=1
     ggml_gemm_i2_i8_s_interleaved(n, s, bs, vx_base, row_start, a_row_bytes, vy, nr, nc);
 }
+
+// =============================================================
+// Exact union-sparse I2_S kernels (opt-in, GGML_I2S_SPARSE=1)
+//
+// Row-sparse: compute only listed weight rows (e.g. ffn_up rows whose gate is <= 0
+// for every token, which relu(gate)^2 multiplies by exactly 0).
+// Column-sparse: skip inner-dim columns whose int8 activation is 0 for every token
+// (e.g. ffn_down inputs after relu^2 + int8 quantization), using a K-major 2-bit copy
+// of the weight. Both produce the same integer sums as the dense kernels.
+// =============================================================
+
+#if defined(__ARM_NEON)
+#include <pthread.h>
+#include <stdlib.h>
+
+void ggml_gemm_i2_i8_s_rows(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+                            const int32_t * rows, int na, const void * GGML_RESTRICT vy, int nr) {
+    const uint8_t * x = (const uint8_t *)vx;
+    const int8_t  * y = (const int8_t *)vy;
+    const int64_t rb = n / 4;
+    if (nr == 1) {
+        for (int i = 0; i < na; i++) {
+            ggml_vec_dot_i2_i8_s(n, s + i, 1, x + rows[i] * rb, rb, y, 0, 1);
+        }
+        return;
+    }
+    for (int i0 = 0; i0 < na; i0 += 4) {
+        const int cnt = na - i0 < 4 ? na - i0 : 4;
+        const uint8_t * x_rows[4];
+        for (int i = 0; i < 4; i++) {
+            x_rows[i] = x + rows[i0 + (i < cnt ? i : 0)] * rb;
+        }
+        for (int c0 = 0; c0 < nr; c0 += 4) {
+            const int rn = nr - c0 < 4 ? nr - c0 : 4;
+            const int8_t * y_cols[4] = { NULL, NULL, NULL, NULL };
+            for (int j = 0; j < rn; j++) {
+                y_cols[j] = y + (int64_t)(c0 + j) * n;
+            }
+            float tile[4][4];
+            i2s_neon_dot_tile4xN(x_rows, y_cols, rn, n, tile);
+            for (int i = 0; i < cnt; i++) {
+                for (int j = 0; j < rn; j++) {
+                    s[(c0 + j) * bs + i0 + i] = tile[i][j];
+                }
+            }
+        }
+    }
+}
+
+// K-major blocked layout: for row block b (32 rows) and column k, 8 bytes; byte j holds
+// the codes of rows b*32 + g*8 + j at bits 6-2g (g = 0..3). Code = w + 1, as in I2_S.
+#define I2S_KMAJ_MAX 1024
+static pthread_mutex_t i2s_kmaj_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { const void * src; int n; int nrows; uint8_t * wk; } i2s_kmaj[I2S_KMAJ_MAX];
+static int i2s_kmaj_n = 0;
+
+const uint8_t * ggml_i2s_kmajor32_get(const void * vx, int n, int nrows) {
+    const uint8_t * res = NULL;
+    pthread_mutex_lock(&i2s_kmaj_mu);
+    for (int i = 0; i < i2s_kmaj_n; i++) {
+        if (i2s_kmaj[i].src == vx && i2s_kmaj[i].n == n && i2s_kmaj[i].nrows == nrows) {
+            res = i2s_kmaj[i].wk;
+            break;
+        }
+    }
+    if (!res && i2s_kmaj_n < I2S_KMAJ_MAX && nrows % 32 == 0 && n % 128 == 0) {
+        const size_t sz = (size_t)nrows * n / 4;
+        uint8_t * wk = (uint8_t *)malloc(sz);
+        if (wk) {
+            memset(wk, 0, sz);
+            const uint8_t * x = (const uint8_t *)vx;
+            const int64_t rbytes = n / 4;
+            for (int r = 0; r < nrows; r++) {
+                const int b = r / 32, g = (r % 32) / 8, j = r % 8;
+                const uint8_t * xr = x + r * rbytes;
+                uint8_t * dst = wk + (size_t)b * n * 8 + j;
+                for (int e = 0; e < n; e++) {
+                    const int w = e % 128;
+                    const int code = (xr[(e / 128) * 32 + (w % 32)] >> (6 - 2 * (w / 32))) & 3;
+                    dst[(size_t)e * 8] |= (uint8_t)(code << (6 - 2 * g));
+                }
+            }
+            i2s_kmaj[i2s_kmaj_n].src = vx;
+            i2s_kmaj[i2s_kmaj_n].n = n;
+            i2s_kmaj[i2s_kmaj_n].nrows = nrows;
+            i2s_kmaj[i2s_kmaj_n].wk = wk;
+            i2s_kmaj_n++;
+            res = wk;
+        }
+    }
+    pthread_mutex_unlock(&i2s_kmaj_mu);
+    return res;
+}
+
+// int16 accumulation: |w*x| <= 128, so 255 columns fit before flushing to int32.
+#define I2S_KMAJ_FLUSH 255
+#define I2S_DEF_KMAJ(TC)                                                                            \
+static void i2s_kmaj32_tc##TC(int n, float * s, size_t bs, const uint8_t * wk, int rb0, int rb1,    \
+                              const int32_t * cols, int na, const int16_t * X, int nr) {            \
+    for (int rb = rb0; rb < rb1; rb++) {                                                            \
+        const uint8_t * wb = wk + (size_t)rb * n * 8;                                               \
+        for (int t0 = 0; t0 < nr; t0 += TC) {                                                       \
+            const int tc = nr - t0 < TC ? nr - t0 : TC;                                             \
+            int32_t acc32[TC][32];                                                                  \
+            memset(acc32, 0, sizeof(acc32));                                                        \
+            for (int a0 = 0; a0 < na; a0 += I2S_KMAJ_FLUSH) {                                       \
+                const int a1 = a0 + I2S_KMAJ_FLUSH < na ? a0 + I2S_KMAJ_FLUSH : na;                 \
+                int16x8_t acc[TC][4];                                                               \
+                for (int t = 0; t < TC; t++)                                                        \
+                    for (int v = 0; v < 4; v++) acc[t][v] = vdupq_n_s16(0);                         \
+                for (int a = a0; a < a1; a++) {                                                     \
+                    const uint8x8_t pk = vld1_u8(wb + (size_t)cols[a] * 8);                         \
+                    int16x8_t w[4];                                                                 \
+                    w[0] = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vshr_n_u8(pk, 6))), vdupq_n_s16(1)); \
+                    w[1] = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vand_u8(vshr_n_u8(pk, 4), vdup_n_u8(3)))), vdupq_n_s16(1)); \
+                    w[2] = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vand_u8(vshr_n_u8(pk, 2), vdup_n_u8(3)))), vdupq_n_s16(1)); \
+                    w[3] = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vand_u8(pk, vdup_n_u8(3)))), vdupq_n_s16(1)); \
+                    const int16_t * xa = X + (size_t)a * nr + t0;                                   \
+                    for (int t = 0; t < TC; t++) {                                                  \
+                        if (t < tc) {                                                               \
+                            const int16x8_t xv = vdupq_n_s16(xa[t]);                                \
+                            for (int v = 0; v < 4; v++) acc[t][v] = vmlaq_s16(acc[t][v], w[v], xv); \
+                        }                                                                           \
+                    }                                                                               \
+                }                                                                                   \
+                for (int t = 0; t < tc; t++)                                                        \
+                    for (int v = 0; v < 4; v++) {                                                   \
+                        int32x4_t lo = vld1q_s32(&acc32[t][v * 8]);                                 \
+                        int32x4_t hi = vld1q_s32(&acc32[t][v * 8 + 4]);                             \
+                        vst1q_s32(&acc32[t][v * 8],     vaddw_s16(lo, vget_low_s16(acc[t][v])));    \
+                        vst1q_s32(&acc32[t][v * 8 + 4], vaddw_s16(hi, vget_high_s16(acc[t][v])));   \
+                    }                                                                               \
+            }                                                                                       \
+            for (int t = 0; t < tc; t++)                                                            \
+                for (int i = 0; i < 32; i++)                                                        \
+                    s[(size_t)(t0 + t) * bs + (rb - rb0) * 32 + i] = (float)acc32[t][i];            \
+        }                                                                                           \
+    }                                                                                               \
+}
+I2S_DEF_KMAJ(1)
+I2S_DEF_KMAJ(2)
+I2S_DEF_KMAJ(4)
+
+void ggml_gemm_i2_kmajor32(int n, float * GGML_RESTRICT s, size_t bs, const uint8_t * GGML_RESTRICT wk,
+                           int rb0, int rb1, const int32_t * cols, int na, const int16_t * X, int nr) {
+    if (nr >= 4)      i2s_kmaj32_tc4(n, s, bs, wk, rb0, rb1, cols, na, X, nr);
+    else if (nr >= 2) i2s_kmaj32_tc2(n, s, bs, wk, rb0, rb1, cols, na, X, nr);
+    else              i2s_kmaj32_tc1(n, s, bs, wk, rb0, rb1, cols, na, X, nr);
+}
+
+bool ggml_i2s_sparse_available(void) { return true; }
+#else
+void ggml_gemm_i2_i8_s_rows(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+                            const int32_t * rows, int na, const void * GGML_RESTRICT vy, int nr) {
+    GGML_UNUSED(n); GGML_UNUSED(s); GGML_UNUSED(bs); GGML_UNUSED(vx); GGML_UNUSED(rows); GGML_UNUSED(na); GGML_UNUSED(vy); GGML_UNUSED(nr);
+    GGML_ABORT("I2_S sparse kernels are NEON-only");
+}
+const uint8_t * ggml_i2s_kmajor32_get(const void * vx, int n, int nrows) {
+    GGML_UNUSED(vx); GGML_UNUSED(n); GGML_UNUSED(nrows);
+    return NULL;
+}
+void ggml_gemm_i2_kmajor32(int n, float * GGML_RESTRICT s, size_t bs, const uint8_t * GGML_RESTRICT wk,
+                           int rb0, int rb1, const int32_t * cols, int na, const int16_t * X, int nr) {
+    GGML_UNUSED(n); GGML_UNUSED(s); GGML_UNUSED(bs); GGML_UNUSED(wk); GGML_UNUSED(rb0); GGML_UNUSED(rb1);
+    GGML_UNUSED(cols); GGML_UNUSED(na); GGML_UNUSED(X); GGML_UNUSED(nr);
+    GGML_ABORT("I2_S sparse kernels are NEON-only");
+}
+bool ggml_i2s_sparse_available(void) { return false; }
+#endif

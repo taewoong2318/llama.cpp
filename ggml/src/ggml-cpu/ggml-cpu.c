@@ -1303,6 +1303,165 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+// Opt-in profiling (GGML_I2S_SPARSE_STATS=1): per-graph busy time, per-layer I2_S matmul
+// time (thread 0's view) and sparse active fractions. Cumulative; printed to stderr every
+// 32 graphs.
+static int ggml_i2s_stats_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GGML_I2S_SPARSE_STATS");
+        on = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return on;
+}
+#define I2S_ST_L 64
+static struct { double ms[3]; double frac[2]; int64_t n[3]; int64_t nf[2]; } i2s_st[I2S_ST_L];
+static double  i2s_st_graph_ms = 0;
+static int64_t i2s_st_graphs   = 0;
+static int i2s_st_layer(const struct ggml_tensor * w, int * kind) {
+    int l = -1;
+    if (sscanf(w->name, "blk.%d.", &l) != 1 || l < 0 || l >= I2S_ST_L) {
+        return -1;
+    }
+    *kind = strstr(w->name, "ffn_up") ? 0 : strstr(w->name, "ffn_down") ? 1 : 2;
+    return l;
+}
+static void i2s_st_frac(const struct ggml_tensor * w, int k, double f) {
+    int kind; const int l = i2s_st_layer(w, &kind);
+    if (l >= 0) { i2s_st[l].frac[k] += f; i2s_st[l].nf[k]++; }
+}
+static void i2s_st_mm(const struct ggml_tensor * w, double ms) {
+    int kind; const int l = i2s_st_layer(w, &kind);
+    if (l >= 0) { i2s_st[l].ms[kind] += ms; i2s_st[l].n[kind]++; }
+}
+static void i2s_st_dump(void) {
+    fprintf(stderr, "I2S_STATS graphs=%lld graph_ms=%.1f", (long long)i2s_st_graphs, i2s_st_graph_ms);
+    for (int l = 0; l < I2S_ST_L; l++) {
+        if (i2s_st[l].n[0] + i2s_st[l].n[1] + i2s_st[l].n[2] == 0) continue;
+        fprintf(stderr, " | L%d up=%.3f dn=%.3f ms_up=%.1f ms_dn=%.1f ms_oth=%.1f", l,
+                i2s_st[l].nf[0] ? i2s_st[l].frac[0] / i2s_st[l].nf[0] : -1.0,
+                i2s_st[l].nf[1] ? i2s_st[l].frac[1] / i2s_st[l].nf[1] : -1.0,
+                i2s_st[l].ms[0], i2s_st[l].ms[1], i2s_st[l].ms[2]);
+    }
+    fprintf(stderr, "\n");
+}
+
+// Exact union-sparse I2_S mul_mat (opt-in with GGML_I2S_SPARSE=1).
+//  - dst->src[2] set (F32, ne01 x ne11): row mask. Rows where mask <= 0 for every column are
+//    skipped and written as 0 (BitNet sets ffn_up's src[2] = pre-relu gate, and relu(gate)^2
+//    multiplies those rows by exactly 0).
+//  - otherwise: inner columns whose int8 activation is 0 for every column are skipped via a
+//    K-major copy of the weight, if at most 90% of the columns are active.
+// Integer sums are identical to the dense kernels, so the output is bit-identical.
+static int ggml_i2s_sparse_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GGML_I2S_SPARSE");
+        on = (e && atoi(e) != 0 && ggml_i2s_sparse_available()) ? 1 : 0;
+    }
+    return on;
+}
+
+static bool ggml_i2s_mul_mat_sparse(const struct ggml_tensor * src0, struct ggml_tensor * dst,
+                                    const void * src1_wdata, const float * act_scales, const int32_t * act_sums,
+                                    float ws, int ith, int nth, int64_t src0_start, int64_t src0_end) {
+    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1];
+    const int64_t ne11 = dst->ne[1];
+    const size_t  nb1  = dst->nb[1];
+    const int8_t * y = (const int8_t *)src1_wdata;
+    const struct ggml_tensor * mask = dst->src[2];
+
+    if (mask) {
+        if (mask->type != GGML_TYPE_F32 || mask->ne[0] != ne01 || mask->ne[1] != ne11) {
+            return false;
+        }
+        const int64_t n_rows = src0_end - src0_start;
+        int32_t * rows = (int32_t *)alloca(n_rows * sizeof(int32_t));
+        int na = 0;
+        for (int64_t r = src0_start; r < src0_end; r++) {
+            bool any = false;
+            for (int64_t c = 0; c < ne11 && !any; c++) {
+                any = ((const float *)((const char *)mask->data + c * mask->nb[1]))[r] > 0.0f;
+            }
+            if (any) {
+                rows[na++] = (int32_t)r;
+            }
+        }
+        if (ith == 0 && ggml_i2s_stats_on() && n_rows > 0) {
+            i2s_st_frac(src0, 0, (double)na / n_rows);
+        }
+        float * tmp = (float *)alloca((na > 0 ? na : 1) * ne11 * sizeof(float));
+        if (na > 0) {
+            ggml_gemm_i2_i8_s_rows((int)ne00, tmp, na, src0->data, rows, na, y, (int)ne11);
+        }
+        for (int64_t c = 0; c < ne11; c++) {
+            float * d = (float *)((char *)dst->data + c * nb1);
+            memset(d + src0_start, 0, n_rows * sizeof(float));
+            const float post_scale = ws / act_scales[c];
+            const int32_t asum = act_sums[c];
+            for (int i = 0; i < na; i++) {
+                d[rows[i]] = (tmp[c * na + i] - asum) * post_scale;
+            }
+        }
+        return true;
+    }
+
+    if (ne01 % 32 != 0 || ne00 % 128 != 0) {
+        return false;
+    }
+    // union of nonzero inputs over all columns; every thread computes it (cheap)
+    static __thread uint8_t * tl_any = NULL;  static __thread int64_t tl_any_cap = 0;
+    static __thread int32_t * tl_cols = NULL; static __thread int64_t tl_cols_cap = 0;
+    static __thread int16_t * tl_X = NULL;    static __thread int64_t tl_X_cap = 0;
+    if (tl_any_cap < ne00) { free(tl_any); tl_any = (uint8_t *)malloc(ne00); tl_any_cap = ne00; }
+    if (tl_cols_cap < ne00) { free(tl_cols); tl_cols = (int32_t *)malloc(ne00 * sizeof(int32_t)); tl_cols_cap = ne00; }
+    if (tl_X_cap < ne00 * ne11) { free(tl_X); tl_X = (int16_t *)malloc(ne00 * ne11 * sizeof(int16_t)); tl_X_cap = ne00 * ne11; }
+    memcpy(tl_any, y, ne00);
+    for (int64_t c = 1; c < ne11; c++) {
+        const uint8_t * yc = (const uint8_t *)y + c * ne00;
+        for (int64_t k = 0; k < ne00; k++) {
+            tl_any[k] |= yc[k];
+        }
+    }
+    int na = 0;
+    for (int64_t k = 0; k < ne00; k++) {
+        if (tl_any[k]) {
+            tl_cols[na++] = (int32_t)k;
+        }
+    }
+    if (ith == 0 && ggml_i2s_stats_on()) {
+        i2s_st_frac(src0, 1, (double)na / ne00);
+    }
+    if (na * 10 > ne00 * 9) {
+        return false;
+    }
+    const uint8_t * wk = ggml_i2s_kmajor32_get(src0->data, (int)ne00, (int)ne01);
+    if (!wk) {
+        return false;
+    }
+    for (int a = 0; a < na; a++) {
+        for (int64_t c = 0; c < ne11; c++) {
+            tl_X[(int64_t)a * ne11 + c] = y[c * ne00 + tl_cols[a]];
+        }
+    }
+    const int nblk = (int)(ne01 / 32);
+    const int rb0 = (int)(((int64_t)ith * nblk) / nth), rb1 = (int)(((int64_t)(ith + 1) * nblk) / nth);
+    if (rb0 >= rb1) {
+        return true;
+    }
+    const int64_t nr_rows = (int64_t)(rb1 - rb0) * 32;
+    float * tmp = (float *)alloca(nr_rows * ne11 * sizeof(float));
+    ggml_gemm_i2_kmajor32((int)ne00, tmp, nr_rows, wk, rb0, rb1, tl_cols, na, tl_X, (int)ne11);
+    for (int64_t c = 0; c < ne11; c++) {
+        float * d = (float *)((char *)dst->data + c * nb1) + (int64_t)rb0 * 32;
+        const float post_scale = ws / act_scales[c];
+        for (int64_t r = 0; r < nr_rows; r++) {
+            d[r] = tmp[c * nr_rows + r] * post_scale;
+        }
+    }
+    return true;
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1507,6 +1666,12 @@ UseGgmlGemm2:;
         const int32_t * act_sums = (const int32_t *)((const char *)act_scales + ne11 * sizeof(float));
         const int64_t n_rows = src0_end - src0_start;
         const float ws = *scale;
+
+        if (ggml_i2s_sparse_enabled() && ne12 == 1 && ne13 == 1 && src1_col_stride == (size_t)ne10 && ne11 <= 64) {
+            if (ggml_i2s_mul_mat_sparse(src0, dst, src1_wdata, act_scales, act_sums, ws, ith, nth, src0_start, src0_end)) {
+                return;
+            }
+        }
 
         // GEMM path: process 4 columns at a time, write directly to destination
         if (ne11 >= 4) {
@@ -2005,7 +2170,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
-                ggml_compute_forward_mul_mat(params, tensor);
+                if (params->ith == 0 && tensor->src[0]->type == GGML_TYPE_I2_S && ggml_i2s_stats_on()) {
+                    const int64_t t0 = ggml_time_us();
+                    ggml_compute_forward_mul_mat(params, tensor);
+                    i2s_st_mm(tensor->src[0], (ggml_time_us() - t0) / 1000.0);
+                } else {
+                    ggml_compute_forward_mul_mat(params, tensor);
+                }
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
@@ -3498,6 +3669,7 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
+    const int64_t i2s_st_t0 = ggml_i2s_stats_on() ? ggml_time_us() : 0;
 
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
@@ -3568,6 +3740,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     if (disposable_threadpool) {
         ggml_threadpool_free(threadpool);
+    }
+
+    if (ggml_i2s_stats_on()) {
+        i2s_st_graph_ms += (ggml_time_us() - i2s_st_t0) / 1000.0;
+        if (++i2s_st_graphs % 32 == 0) {
+            i2s_st_dump();
+        }
     }
 
     return ret;

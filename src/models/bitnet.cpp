@@ -127,12 +127,41 @@ llama_model_bitnet::graph::graph(const llama_model & model, const llm_graph_para
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        cur = build_ffn(cur,
-                model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
-                model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
-                NULL,                      NULL, NULL,
-                NULL,
-                hparams.llm_ffn_op, LLM_FFN_PAR, il);
+        if (hparams.llm_ffn_op == LLM_FFN_RELU_SQR) {
+            // Same ops as build_ffn(RELU_SQR, PAR), but gate is computed first and passed to
+            // the up matmul as src[2]: rows where gate <= 0 for every token are multiplied by
+            // relu(gate)^2 == 0, so the CPU backend may skip them (GGML_I2S_SPARSE=1).
+            ggml_tensor * gate = build_lora_mm(model.layers[il].ffn_gate, cur);
+            cb(gate, "ffn_gate", il);
+            if (model.layers[il].ffn_gate_s) {
+                gate = ggml_mul(ctx0, gate, model.layers[il].ffn_gate_s);
+                cb(gate, "ffn_gate_s", il);
+            }
+
+            ggml_tensor * up = build_lora_mm(model.layers[il].ffn_up, cur);
+            if (up->op == GGML_OP_MUL_MAT) {
+                up->src[2] = gate;
+            }
+            cb(up, "ffn_up", il);
+            if (model.layers[il].ffn_up_s) {
+                up = ggml_mul(ctx0, up, model.layers[il].ffn_up_s);
+                cb(up, "ffn_up_s", il);
+            }
+
+            cur = ggml_relu(ctx0, gate);
+            cb(cur, "ffn_relu", il);
+            cur = ggml_sqr(ctx0, cur);
+            cb(cur, "ffn_sqr(relu)", il);
+            cur = ggml_mul(ctx0, cur, up);
+            cb(cur, "ffn_gate_par", il);
+        } else {
+            cur = build_ffn(cur,
+                    model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+                    model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                    NULL,                      NULL, NULL,
+                    NULL,
+                    hparams.llm_ffn_op, LLM_FFN_PAR, il);
+        }
         cb(cur, "ffn_sub_out", il);
 
         cur = build_norm(cur,
