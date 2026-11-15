@@ -15,6 +15,7 @@
 #include "ggml.h"
 #include "ggml-quants.h"
 #include "ggml-cpu-i2s.h"
+#include "ggml-cpu-vlut.h"
 #include "common.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -1488,6 +1489,25 @@ void ggml_compute_forward_mul_mat(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    if (src0->type == GGML_TYPE_I2_V_4) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1);
+        GGML_ASSERT(params->wsize >= ggml_vlut_wsize(ne10, ne11));
+        // the kernel uses ne01 both as the dst row stride and as the weight block stride
+        GGML_ASSERT(nb1 == ne01 * sizeof(float));
+
+        ggml_vlut_quantize_act((const char *) src1->data, nb11, ne10, ne11, params->wdata, ith, nth);
+        ggml_barrier(params->threadpool);
+
+        const int64_t r0 = (ith * ne01) / nth;
+        const int64_t r1 = ((ith + 1) * ne01) / nth;
+        if (r0 < r1) {
+            ggml_gemm_i2v4_i8v_lut(ith, nth, ne00, (float *) dst->data + r0, ne01,
+                                   (const char *) src0->data + r0 * 4, params->wdata, ne11, r1 - r0);
+        }
+        return;
+    }
 
     enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
     ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
@@ -3175,6 +3195,9 @@ struct ggml_cplan ggml_graph_plan(
                             cur = ggml_bitnet_mul_mat_get_wsize(node->src[0], node->src[1], node);
                         } else
 #endif
+                        if (node->src[0]->type == GGML_TYPE_I2_V_4) {
+                            cur = ggml_vlut_wsize(node->src[1]->ne[0], node->src[1]->ne[1]);
+                        } else
                         if (node->src[1]->type != vec_dot_type) {
                             if (vec_dot_type == GGML_TYPE_I8_S) {
                                 // I2_S needs extra space for act_scales and act_sums

@@ -953,6 +953,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(int8_t),
         .is_quantized             = false,
     },
+    [GGML_TYPE_I2_V_4] = {
+        .type_name                = "i2_v_4",
+        .blck_size                = 4,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -7793,6 +7799,12 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TQ1_0:   result = quantize_tq1_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ2_0:   result = quantize_tq2_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_I2_S:    result = quantize_i2_s   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_I2_V_4:
+            {
+                // rows are interleaved, so the whole matrix must be quantized in one chunk
+                GGML_ASSERT(start == 0);
+                result = quantize_i2_v_4(src, dst, nrows, n_per_row, imatrix);
+            } break;
         case GGML_TYPE_IQ2_XXS: result = quantize_iq2_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XS:  result = quantize_iq2_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ3_XXS: result = quantize_iq3_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

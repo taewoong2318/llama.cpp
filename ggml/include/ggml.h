@@ -431,7 +431,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_TL2     = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_I2_V_4  = 43, // Vec-LUT ternary, base-3 packed, rows interleaved per 16 K
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision

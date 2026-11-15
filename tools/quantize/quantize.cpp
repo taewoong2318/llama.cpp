@@ -47,6 +47,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "TQ1_0",    LLAMA_FTYPE_MOSTLY_TQ1_0,    " 1.69 bpw ternarization",           },
     { "TQ2_0",    LLAMA_FTYPE_MOSTLY_TQ2_0,    " 2.06 bpw ternarization",           },
     { "I2_S",     LLAMA_FTYPE_MOSTLY_I2_S,     " 2 bpw BitNet ternarization",       },
+    { "I2_V_4",   LLAMA_FTYPE_MOSTLY_I2_V_4,   " 2 bpw Vec-LUT ternarization",      },
     { "Q2_K",     LLAMA_FTYPE_MOSTLY_Q2_K,     " 2.96G, +3.5199 ppl @ Llama-3-8B",  },
     { "Q2_K_S",   LLAMA_FTYPE_MOSTLY_Q2_K_S,   " 2.96G, +3.1836 ppl @ Llama-3-8B",  },
     { "IQ3_XXS",  LLAMA_FTYPE_MOSTLY_IQ3_XXS,  " 3.06 bpw quantization",            },

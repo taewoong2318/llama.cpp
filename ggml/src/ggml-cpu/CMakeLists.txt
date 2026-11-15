@@ -36,6 +36,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/quants.c
         ggml-cpu/quants.h
         ggml-cpu/ggml-cpu-i2s.c
+        ggml-cpu/ggml-cpu-vlut.c
+        ggml-cpu/ggml-cpu-vlut.h
         ggml-cpu/traits.cpp
         ggml-cpu/traits.h
         ggml-cpu/amx/amx.cpp
@@ -73,6 +75,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             message(WARNING "Accelerate framework not found")
         endif()
     endif()
+
+    target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_VLUT_TABLE_ENTRY_SIZE=${GGML_VLUT_TABLE_ENTRY_SIZE})
 
     if (GGML_OPENMP_ENABLED)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)

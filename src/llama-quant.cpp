@@ -818,6 +818,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_TQ1_0:   return GGML_TYPE_TQ1_0;
         case LLAMA_FTYPE_MOSTLY_TQ2_0:   return GGML_TYPE_TQ2_0;
         case LLAMA_FTYPE_MOSTLY_I2_S:    return GGML_TYPE_I2_S;
+        case LLAMA_FTYPE_MOSTLY_I2_V_4:  return GGML_TYPE_I2_V_4;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: return GGML_TYPE_IQ2_XXS;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  return GGML_TYPE_IQ2_XS;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:   return GGML_TYPE_IQ2_XS;
@@ -1232,7 +1233,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t nrows = tensor->ne[1];
 
                 static const int64_t min_chunk_size = 32 * 512;
-                const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
+                int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
+                if (new_type == GGML_TYPE_I2_V_4) {
+                    // rows are interleaved, quantize the whole matrix at once
+                    chunk_size = n_per_row * nrows;
+                }
 
                 const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;

@@ -5579,6 +5579,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
         case GGML_TYPE_I2_S:
+        case GGML_TYPE_I2_V_4:
             // nothing to validate
             break;
         default:
@@ -5593,3 +5594,27 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
 // ====================== BitNet I2_S quantization functions ======================
 
+// ====================== Vec-LUT I2_V_4 quantization ======================
+//
+// Each byte packs 4 ternary weights in base 3 (digit 0/1/2 = -1/0/+1). Every 16 consecutive
+// K values form a block of 4 bytes per row, and a block stores all rows contiguously:
+// byte (row j, k-byte i) is at (i/4)*nrow*4 + j*4 + i%4. Layout from vlut.cpp (MIT).
+
+size_t quantize_i2_v_4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    GGML_ASSERT(n_per_row % 16 == 0);
+
+    uint8_t * w = (uint8_t *) dst;
+    for (int64_t i = 0; i * 4 < n_per_row; i++) {
+        for (int64_t j = 0; j < nrow; j++) {
+            uint8_t b = 0;
+            for (int k = 3; k >= 0; k--) {
+                const float v = src[j * n_per_row + i * 4 + k];
+                b = b * 3 + (fabsf(v) > 1e-6f ? (v > 0.0f ? 2 : 0) : 1);
+            }
+            w[i / 4 * nrow * 4 + j * 4 + i % 4] = b;
+        }
+    }
+
+    return nrow * ggml_row_size(GGML_TYPE_I2_V_4, n_per_row);
+}
